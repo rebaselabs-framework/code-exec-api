@@ -1,22 +1,40 @@
 """
-Code Execution API v1.0.0 — Sandboxed Python execution for AI agents.
+Code Execution API v2.0.0 — Multi-language sandboxed execution for AI agents.
 
 AI agents can't run code themselves — this API lets them execute Python
-safely and get structured output back.
+and JavaScript safely and get structured output back.
 
-Sandbox design:
+Python sandbox:
   - RestrictedPython: compiles code with safe AST transforms
-  - Whitelisted builtins: math, string, data structure operations
-  - Whitelisted stdlib imports: math, json, re, statistics, itertools,
-    functools, collections, datetime, decimal, random
+  - Whitelisted stdlib: math, json, re, statistics, itertools, collections,
+    datetime, decimal, random, hashlib, base64, struct, copy, enum, typing
   - Blocked: os, sys, subprocess, socket, http, open, eval, exec
-  - Hard limits: 15s timeout, 256MB memory, 50KB output cap
+  - Hard limits: 30s timeout, 50KB output cap
+
+JavaScript sandbox:
+  - Node.js subprocess with --disallow-code-generation-from-strings
+  - Blocked require(): fs, child_process, os, net, http, https, cluster,
+    dgram, dns, tls, v8, vm, worker_threads, readline
+  - Allowed: built-in Node.js globals (Math, JSON, Date, Buffer, etc.)
+  - Hard limits: 30s timeout, 50KB output cap
+
+Sessions (Python only):
+  - Stateful namespaces that persist across multiple execute calls
+  - POST /api/session/create  — create a session
+  - POST /api/session/execute — run code with shared state
+  - DELETE /api/session/{id}  — delete session
+  - Sessions auto-expire after 10 minutes of inactivity
 
 Endpoints:
-  POST /api/execute        — run Python code, return stdout/result
-  POST /api/execute/batch  — run up to 10 snippets concurrently
-  GET  /health             — service health
-  GET  /                   — service info + endpoint list
+  POST /api/execute           — run code (language: python | javascript)
+  POST /api/execute/python    — Python shorthand
+  POST /api/execute/js        — JavaScript shorthand
+  POST /api/execute/batch     — run up to 10 snippets concurrently
+  POST /api/session/create    — create a stateful Python session
+  POST /api/session/execute   — execute in session context
+  DELETE /api/session/{id}    — destroy session
+  GET  /health                — service health
+  GET  /                      — service info + endpoint list
 
 Auth:
   X-API-Key: <key>   (or Bearer token)
@@ -30,11 +48,15 @@ import builtins as _builtins_module
 import json
 import logging
 import os
+import secrets
+import tempfile
 import time
 import traceback
+import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -75,12 +97,23 @@ except ImportError:
 # Config
 # ──────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 MAX_TIMEOUT_SECONDS = 30
 DEFAULT_TIMEOUT_SECONDS = 10
-MAX_OUTPUT_BYTES = 50_000   # 50KB
+MAX_OUTPUT_BYTES = 50_000     # 50KB
 MAX_BATCH_SIZE = 10
-MAX_CODE_LENGTH = 50_000    # 50KB of code
+MAX_CODE_LENGTH = 50_000      # 50KB of code
+SESSION_TTL_SECONDS = 600     # 10 min session inactivity timeout
+MAX_SESSIONS = 200            # max concurrent sessions
+
+# Detect Node.js availability
+_NODE_AVAILABLE = False
+try:
+    import subprocess as _subprocess
+    _r = _subprocess.run(["node", "--version"], capture_output=True, timeout=3)
+    _NODE_AVAILABLE = _r.returncode == 0
+except Exception:
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("code-exec-api")
@@ -369,18 +402,260 @@ async def execute_code(
 
 
 # ──────────────────────────────────────────────
+# JavaScript execution engine
+# ──────────────────────────────────────────────
+
+# Modules blocked from require() in the JS sandbox
+_JS_BLOCKED_MODULES = frozenset({
+    "fs", "path", "child_process", "os", "net", "http", "https",
+    "cluster", "dgram", "dns", "readline", "repl", "tls", "v8",
+    "vm", "worker_threads", "module", "process", "native_module",
+})
+
+_JS_SANDBOX_WRAPPER = """\
+'use strict';
+// ── Sandbox: block dangerous require() calls ──────────────────
+const _BLOCKED_MODS = new Set({blocked_json});
+const _orig_require = (typeof require !== 'undefined') ? require : null;
+if (_orig_require) {{
+  global.require = function sandboxedRequire(mod) {{
+    const root = String(mod).split('/')[0].split('\\\\')[0].replace(/^@[^/]+\\//, '');
+    if (_BLOCKED_MODS.has(root)) {{
+      throw new Error("require('" + mod + "') is not allowed in the sandbox.");
+    }}
+    return _orig_require(mod);
+  }};
+}}
+
+// ── Inject caller-provided variables ──────────────────────────
+const _injected = {vars_json};
+Object.keys(_injected).forEach(k => {{ global[k] = _injected[k]; }});
+
+// ── User code ─────────────────────────────────────────────────
+let result = undefined;
+(async () => {{
+  try {{
+{indented_code}
+  }} catch (e) {{
+    process.stderr.write((e && e.stack) ? e.stack : String(e));
+    process.exitCode = 1;
+    return;
+  }}
+  if (typeof result !== 'undefined') {{
+    process.stdout.write('\\n__EXEC_RESULT__:' + JSON.stringify(result) + '\\n');
+  }}
+}})();
+"""
+
+
+async def _run_js_code(
+    code: str,
+    injected_vars: Dict[str, Any],
+    timeout: float,
+) -> "ExecutionResult":
+    """Execute JavaScript in a Node.js subprocess with security restrictions."""
+    res = ExecutionResult()
+    start = time.monotonic()
+
+    if not _NODE_AVAILABLE:
+        res.error = "Node.js is not available on this server."
+        return res
+
+    # Build sandbox wrapper
+    vars_json = json.dumps(injected_vars, default=str)
+    blocked_json = json.dumps(sorted(_JS_BLOCKED_MODULES))
+    indented = "\n".join("    " + line for line in code.splitlines())
+    wrapper = _JS_SANDBOX_WRAPPER.format(
+        vars_json=vars_json,
+        blocked_json=blocked_json,
+        indented_code=indented,
+    )
+
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8") as f:
+            f.write(wrapper)
+            tmp = f.name
+
+        proc = await asyncio.create_subprocess_exec(
+            "node",
+            "--disallow-code-generation-from-strings",
+            "--max-old-space-size=256",
+            tmp,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            res.error = f"Execution timed out after {timeout:.0f}s."
+            res.elapsed_ms = int(timeout * 1000)
+            return res
+
+        raw_stdout = stdout_b.decode("utf-8", errors="replace")
+        raw_stderr = stderr_b.decode("utf-8", errors="replace")
+
+        # Extract __EXEC_RESULT__ sentinel
+        clean_lines = []
+        for line in raw_stdout.splitlines():
+            if line.startswith("__EXEC_RESULT__:"):
+                try:
+                    res.result = json.loads(line[len("__EXEC_RESULT__:"):])
+                except Exception:
+                    res.result = line[len("__EXEC_RESULT__:"):]
+            else:
+                clean_lines.append(line)
+
+        res.stdout = "\n".join(clean_lines)
+        if len(res.stdout) > MAX_OUTPUT_BYTES:
+            res.stdout = res.stdout[:MAX_OUTPUT_BYTES]
+            res.truncated = True
+
+        # Sanitize stderr — strip internal Node.js frames, keep user frames
+        if raw_stderr:
+            stderr_lines = raw_stderr.splitlines()
+            user_lines = [
+                ln for ln in stderr_lines
+                if not (ln.strip().startswith("at ") and (
+                    "/node_modules/" in ln or "node:internal" in ln or ln.endswith("(node:timers)")
+                ))
+            ]
+            res.stderr = "\n".join(user_lines[:20])
+            if proc.returncode != 0:
+                res.error = f"JavaScript runtime error (exit {proc.returncode})"
+
+    except Exception as exc:
+        res.error = f"JS execution setup error: {exc}"
+    finally:
+        res.elapsed_ms = int((time.monotonic() - start) * 1000)
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+    return res
+
+
+# ──────────────────────────────────────────────
+# Python session store (stateful execution)
+# ──────────────────────────────────────────────
+
+@dataclass
+class _Session:
+    session_id: str
+    language: str
+    globals: Dict[str, Any] = dc_field(default_factory=dict)
+    created_at: float = dc_field(default_factory=time.monotonic)
+    last_used: float = dc_field(default_factory=time.monotonic)
+    execution_count: int = 0
+    stdout_history: List[str] = dc_field(default_factory=list)
+
+
+_sessions: Dict[str, _Session] = {}
+
+
+def _get_session(session_id: str) -> Optional[_Session]:
+    sess = _sessions.get(session_id)
+    if sess and (time.monotonic() - sess.last_used) > SESSION_TTL_SECONDS:
+        del _sessions[session_id]
+        return None
+    return sess
+
+
+def _expire_sessions() -> None:
+    """Remove stale sessions."""
+    now = time.monotonic()
+    expired = [sid for sid, s in list(_sessions.items()) if now - s.last_used > SESSION_TTL_SECONDS]
+    for sid in expired:
+        _sessions.pop(sid, None)
+
+
+def _run_session_code_sync(
+    code: str,
+    session: _Session,
+    timeout: float,
+) -> "ExecutionResult":
+    """Execute code in a persistent session namespace."""
+    res = ExecutionResult()
+    start = time.monotonic()
+    try:
+        globs = session.globals
+        # Ensure sandbox guards are set up on first call
+        if "__builtins__" not in globs:
+            globs.update(_build_sandbox_globals({}))
+        # Re-initialise PrintCollector for this run
+        if RESTRICTED_PYTHON_AVAILABLE:
+            globs["_print_"] = PrintCollector
+
+        if RESTRICTED_PYTHON_AVAILABLE:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                bytecode = compile_restricted(code, filename="<session>", mode="exec")
+            if bytecode is None:
+                res.error = "Code failed to compile (restricted syntax check)."
+                return res
+        else:
+            _basic_safety_check(code)
+            bytecode = compile(code, "<session>", "exec")
+
+        exec(bytecode, globs)  # noqa: S102
+
+        if RESTRICTED_PYTHON_AVAILABLE:
+            printer = globs.get("_print")
+            if printer is not None and isinstance(printer, PrintCollector):
+                res.stdout = printer()
+        if "result" in globs:
+            val = globs["result"]
+            try:
+                res.result = json.loads(json.dumps(val, default=str))
+            except Exception:
+                res.result = str(val)
+    except SyntaxError as e:
+        res.error = f"SyntaxError: {e}"
+    except ImportError as e:
+        res.error = f"ImportError: {e}"
+    except NameError as e:
+        res.error = f"NameError: {e}"
+    except Exception as e:
+        tb = traceback.format_exc()
+        lines = [ln for ln in tb.splitlines()
+                 if "<session>" in ln or (not ln.startswith("  File") and not ln.startswith("Traceback"))]
+        res.error = f"{type(e).__name__}: {e}"
+        res.stderr = "\n".join(lines[-10:])
+    finally:
+        res.elapsed_ms = int((time.monotonic() - start) * 1000)
+        if len(res.stdout) > MAX_OUTPUT_BYTES:
+            res.stdout = res.stdout[:MAX_OUTPUT_BYTES]
+            res.truncated = True
+    return res
+
+
+# ──────────────────────────────────────────────
 # Request / Response models
 # ──────────────────────────────────────────────
 
 class ExecuteRequest(BaseModel):
     code: str = Field(
         ...,
-        description="Python code to execute. Set `result` variable to capture structured output.",
-        examples=["import math\nresult = math.sqrt(144)\nprint(f'Answer: {result}')"],
+        description=(
+            "Code to execute. Set `result` variable to capture structured output.\n"
+            "Python: `import math; result = math.sqrt(144)`\n"
+            "JavaScript: `result = [1,2,3].map(x => x*2)`"
+        ),
+    )
+    language: str = Field(
+        "python",
+        description="Language: 'python' (default) or 'javascript'",
     )
     variables: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Pre-injected variables available in the code namespace (e.g. pass data as 'rows').",
+        description="Pre-injected variables in the code namespace (e.g. pass data as 'rows').",
     )
     timeout: float = Field(
         DEFAULT_TIMEOUT_SECONDS,
@@ -398,10 +673,17 @@ class ExecuteRequest(BaseModel):
             raise ValueError("Code cannot be empty.")
         return v
 
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, v: str) -> str:
+        v = v.lower().strip()
+        if v not in ("python", "javascript", "js"):
+            raise ValueError("language must be 'python' or 'javascript'")
+        return "javascript" if v == "js" else v
+
     @field_validator("variables")
     @classmethod
     def validate_variables(cls, v: dict) -> dict:
-        # Serialize/deserialize to ensure all values are JSON-safe
         try:
             return json.loads(json.dumps(v))
         except (TypeError, ValueError) as e:
@@ -410,6 +692,7 @@ class ExecuteRequest(BaseModel):
 
 class ExecuteResponse(BaseModel):
     success: bool
+    language: str = "python"
     stdout: str
     stderr: str
     result: Optional[Any] = None
@@ -438,6 +721,56 @@ class ProvisionKeyRequest(BaseModel):
     calls_limit: Optional[int] = Field(None, description="Override call limit.")
 
 
+class CreateSessionRequest(BaseModel):
+    language: str = Field("python", description="Session language: python (js sessions not stateful yet)")
+    label: str = Field("", description="Optional label for this session.")
+
+
+class CreateSessionResponse(BaseModel):
+    session_id: str
+    language: str
+    created_at: float
+    ttl_seconds: int = SESSION_TTL_SECONDS
+    message: str
+
+
+class SessionExecuteRequest(BaseModel):
+    session_id: str = Field(..., description="Session ID from POST /api/session/create")
+    code: str = Field(..., description="Code to execute in the session namespace")
+    timeout: float = Field(DEFAULT_TIMEOUT_SECONDS, ge=1, le=MAX_TIMEOUT_SECONDS)
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, v: str) -> str:
+        if len(v) > MAX_CODE_LENGTH:
+            raise ValueError(f"Code exceeds maximum length of {MAX_CODE_LENGTH} characters.")
+        if not v.strip():
+            raise ValueError("Code cannot be empty.")
+        return v
+
+
+class SessionExecuteResponse(BaseModel):
+    success: bool
+    session_id: str
+    stdout: str
+    stderr: str
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    elapsed_ms: int
+    execution_count: int
+    truncated: bool = False
+
+
+class SessionInfoResponse(BaseModel):
+    session_id: str
+    language: str
+    execution_count: int
+    age_seconds: float
+    idle_seconds: float
+    variable_names: List[str]
+    ttl_seconds: int
+
+
 # ──────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────
@@ -448,11 +781,20 @@ def root():
         "service": "Code Execution API",
         "version": VERSION,
         "status": "online",
-        "sandbox": "RestrictedPython" if RESTRICTED_PYTHON_AVAILABLE else "AST-guard",
+        "languages": {
+            "python": {"sandbox": "RestrictedPython" if RESTRICTED_PYTHON_AVAILABLE else "AST-guard"},
+            "javascript": {"available": _NODE_AVAILABLE, "runtime": "Node.js"},
+        },
         "endpoints": {
-            "execute":       "POST /api/execute",
-            "execute_batch": "POST /api/execute/batch",
-            "health":        "GET  /health",
+            "execute":          "POST /api/execute          — run code (language: python|javascript)",
+            "execute_python":   "POST /api/execute/python   — Python shorthand",
+            "execute_js":       "POST /api/execute/js       — JavaScript shorthand",
+            "execute_batch":    "POST /api/execute/batch    — up to 10 concurrent tasks",
+            "session_create":   "POST /api/session/create   — create stateful Python session",
+            "session_execute":  "POST /api/session/execute  — run code in session",
+            "session_info":     "GET  /api/session/{id}     — session status + variables",
+            "session_delete":   "DELETE /api/session/{id}   — destroy session",
+            "health":           "GET  /health",
             "provision_key": "POST /api/keys  (admin only)",
             "list_keys":     "GET  /api/keys/list  (admin only)",
             "docs":          "GET  /docs",
@@ -472,7 +814,9 @@ def health():
     return {
         "status": "healthy",
         "version": VERSION,
-        "sandbox": "RestrictedPython" if RESTRICTED_PYTHON_AVAILABLE else "AST-guard",
+        "python_sandbox": "RestrictedPython" if RESTRICTED_PYTHON_AVAILABLE else "AST-guard",
+        "javascript": _NODE_AVAILABLE,
+        "active_sessions": len(_sessions),
     }
 
 
@@ -481,31 +825,22 @@ def help_endpoint():
     return root()
 
 
-# ── Execute ────────────────────────────────────
+# ── Shared execution dispatcher ─────────────────
 
-@app.post("/api/execute", response_model=ExecuteResponse)
-async def api_execute(req: ExecuteRequest):
-    """
-    Execute Python code in a sandboxed environment.
-
-    **Tip:** Set the `result` variable in your code to return structured data:
-    ```python
-    data = [{"name": "Alice", "score": 95}, {"name": "Bob", "score": 82}]
-    result = sorted(data, key=lambda x: x["score"], reverse=True)
-    print(f"Top scorer: {result[0]['name']}")
-    ```
-
-    **Injecting data via variables:**
-    ```json
-    {
-      "code": "result = [r for r in rows if r['revenue'] > 1000]",
-      "variables": {"rows": [{"name": "Acme", "revenue": 5000}, ...]}
-    }
-    ```
-    """
-    res = await execute_code(req.code, req.variables, req.timeout)
+async def _dispatch_execute(req: ExecuteRequest) -> ExecuteResponse:
+    """Run code in the appropriate language sandbox and return a response."""
+    if req.language == "javascript":
+        if not _NODE_AVAILABLE:
+            raise HTTPException(
+                status_code=503,
+                detail="JavaScript execution requires Node.js, which is not available on this server.",
+            )
+        res = await _run_js_code(req.code, req.variables, req.timeout)
+    else:
+        res = await execute_code(req.code, req.variables, req.timeout)
     return ExecuteResponse(
         success=res.error is None,
+        language=req.language,
         stdout=res.stdout,
         stderr=res.stderr,
         result=res.result,
@@ -515,34 +850,187 @@ async def api_execute(req: ExecuteRequest):
     )
 
 
+# ── Execute (multi-language) ────────────────────
+
+@app.post("/api/execute", response_model=ExecuteResponse)
+async def api_execute(req: ExecuteRequest):
+    """
+    Execute code in a sandboxed environment.
+
+    Supports **Python** (default) and **JavaScript** (Node.js).
+
+    **Python example:**
+    ```python
+    import statistics
+    scores = [88, 92, 95, 78, 90]
+    result = {"mean": statistics.mean(scores), "max": max(scores)}
+    print(f"Average: {result['mean']}")
+    ```
+
+    **JavaScript example:**
+    ```json
+    {
+      "language": "javascript",
+      "code": "const nums = rows.map(r => r.revenue); result = nums.reduce((a,b) => a+b, 0);",
+      "variables": {"rows": [{"revenue": 100}, {"revenue": 200}]}
+    }
+    ```
+
+    Set `result` in your code to capture structured data in the response.
+    """
+    return await _dispatch_execute(req)
+
+
+@app.post("/api/execute/python", response_model=ExecuteResponse)
+async def api_execute_python(req: ExecuteRequest):
+    """Execute Python code. Shorthand for POST /api/execute with language='python'."""
+    req.language = "python"
+    return await _dispatch_execute(req)
+
+
+@app.post("/api/execute/js", response_model=ExecuteResponse)
+async def api_execute_js(req: ExecuteRequest):
+    """Execute JavaScript (Node.js) code. Shorthand for POST /api/execute with language='javascript'."""
+    req.language = "javascript"
+    return await _dispatch_execute(req)
+
+
 @app.post("/api/execute/batch", response_model=BatchExecuteResponse)
 async def api_execute_batch(req: BatchExecuteRequest):
     """
-    Execute up to 10 Python snippets concurrently.
+    Execute up to 10 code snippets concurrently (Python and/or JavaScript).
 
     All tasks run in parallel. Each task has its own isolated namespace.
+    Mix languages: some tasks can be Python, others JavaScript.
     """
     start = time.monotonic()
     tasks = [
-        execute_code(t.code, t.variables, t.timeout)
+        _dispatch_execute(t)
         for t in req.tasks
     ]
     results = await asyncio.gather(*tasks)
     total_elapsed = int((time.monotonic() - start) * 1000)
 
-    responses = [
-        ExecuteResponse(
-            success=r.error is None,
-            stdout=r.stdout,
-            stderr=r.stderr,
-            result=r.result,
-            error=r.error,
-            elapsed_ms=r.elapsed_ms,
-            truncated=r.truncated,
+    # results are already ExecuteResponse objects from _dispatch_execute
+    return BatchExecuteResponse(results=list(results), total_elapsed_ms=total_elapsed)
+
+
+# ── Session endpoints ───────────────────────────
+
+@app.post("/api/session/create", response_model=CreateSessionResponse, tags=["sessions"])
+async def api_session_create(req: CreateSessionRequest):
+    """Create a stateful Python session.
+
+    Sessions preserve variables between code calls — run multiple
+    snippets that share state. Perfect for multi-step analysis:
+
+    ```
+    # Call 1: load and clean data
+    rows = [{"name": "Alice", "score": 95}, {"name": "Bob", "score": 82}]
+    cleaned = [r for r in rows if r["score"] > 80]
+
+    # Call 2: compute stats (cleaned is still in scope)
+    import statistics
+    result = {"mean": statistics.mean(r["score"] for r in cleaned)}
+    ```
+
+    Sessions auto-expire after 10 minutes of inactivity.
+    """
+    _expire_sessions()
+    if len(_sessions) >= MAX_SESSIONS:
+        raise HTTPException(status_code=503, detail=f"Session limit reached ({MAX_SESSIONS}).")
+
+    if req.language != "python":
+        raise HTTPException(status_code=400, detail="Only 'python' sessions are supported currently.")
+
+    sid = str(uuid.uuid4())
+    sess = _Session(session_id=sid, language=req.language)
+    # Pre-initialise sandbox globals
+    sess.globals.update(_build_sandbox_globals({}))
+    _sessions[sid] = sess
+
+    return CreateSessionResponse(
+        session_id=sid,
+        language=req.language,
+        created_at=sess.created_at,
+        ttl_seconds=SESSION_TTL_SECONDS,
+        message=f"Session created. Use POST /api/session/execute with session_id='{sid}'",
+    )
+
+
+@app.post("/api/session/execute", response_model=SessionExecuteResponse, tags=["sessions"])
+async def api_session_execute(req: SessionExecuteRequest):
+    """Execute code within a persistent session namespace.
+
+    Variables set in previous calls remain available.
+    The `result` variable is reset each call; set it to capture structured output.
+    """
+    sess = _get_session(req.session_id)
+    if sess is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{req.session_id}' not found or expired. Create a new one.",
         )
-        for r in results
+
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(_executor, _run_session_code_sync, req.code, sess, req.timeout)
+        res = await asyncio.wait_for(future, timeout=req.timeout + 2)
+    except asyncio.TimeoutError:
+        res = ExecutionResult()
+        res.error = f"Execution timed out after {req.timeout:.0f}s."
+        res.elapsed_ms = int(req.timeout * 1000)
+
+    sess.last_used = time.monotonic()
+    sess.execution_count += 1
+    if res.stdout:
+        sess.stdout_history.append(res.stdout)
+
+    return SessionExecuteResponse(
+        success=res.error is None,
+        session_id=req.session_id,
+        stdout=res.stdout,
+        stderr=res.stderr,
+        result=res.result,
+        error=res.error,
+        elapsed_ms=res.elapsed_ms,
+        execution_count=sess.execution_count,
+        truncated=res.truncated,
+    )
+
+
+@app.get("/api/session/{session_id}", response_model=SessionInfoResponse, tags=["sessions"])
+async def api_session_info(session_id: str):
+    """Get session status, variable names, and usage stats."""
+    sess = _get_session(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found or expired.")
+
+    now = time.monotonic()
+    # List user-defined variables (exclude sandbox internals)
+    user_vars = [
+        k for k in sess.globals.keys()
+        if not k.startswith("_") and k not in ("__builtins__", "__name__", "__build_class__")
     ]
-    return BatchExecuteResponse(results=responses, total_elapsed_ms=total_elapsed)
+
+    return SessionInfoResponse(
+        session_id=session_id,
+        language=sess.language,
+        execution_count=sess.execution_count,
+        age_seconds=round(now - sess.created_at, 1),
+        idle_seconds=round(now - sess.last_used, 1),
+        variable_names=sorted(user_vars),
+        ttl_seconds=max(0, int(SESSION_TTL_SECONDS - (now - sess.last_used))),
+    )
+
+
+@app.delete("/api/session/{session_id}", tags=["sessions"])
+async def api_session_delete(session_id: str):
+    """Destroy a session and free its memory."""
+    if session_id in _sessions:
+        del _sessions[session_id]
+        return {"status": "deleted", "session_id": session_id}
+    raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
 
 
 # ── Auth admin ─────────────────────────────────
