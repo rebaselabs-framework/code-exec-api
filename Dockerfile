@@ -12,9 +12,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Verify Node.js install
 RUN node --version && npm --version
 
-# Python deps
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+# Python deps — explicit list avoids editable-install fragility with large packages
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115.0" \
+    "uvicorn[standard]>=0.30.0" \
+    "pydantic>=2.0.0" \
+    "RestrictedPython>=7.1" \
+    "click>=8.0.0" \
+    "httpx>=0.27.0" \
+    "numpy>=1.26" \
+    "pandas>=2.2"
 
 # App source
 COPY auth.py app.py ./
@@ -26,7 +33,7 @@ ENV AUTH_DB_PATH=/app/data/auth.db
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Single worker required: in-memory sessions are worker-local.
