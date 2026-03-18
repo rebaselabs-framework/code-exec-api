@@ -2,14 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps + Node.js 22.x (for JavaScript execution sandbox)
+# System deps — Node.js from Debian Bookworm official repos (avoids curl-pipe-bash fragility)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    nodejs \
+    npm \
     curl \
-    gnupg \
-    ca-certificates \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify Node.js install
