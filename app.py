@@ -72,6 +72,7 @@ from auth import (
     list_keys,
     revoke_key,
 )
+from help import HelpMiddleware, build_service_help
 
 # ──────────────────────────────────────────────
 # Optional sandbox dep
@@ -143,6 +144,7 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 app.add_middleware(ApiKeyMiddleware)
+app.add_middleware(HelpMiddleware)
 
 # ──────────────────────────────────────────────
 # Sandbox: safe imports whitelist
@@ -806,6 +808,8 @@ def root():
             "max_code_length": MAX_CODE_LENGTH,
         },
         "safe_imports": sorted(SAFE_MODULES),
+        "_help_protocol": "Add ?_help to any endpoint URL, or POST {'_help': true} in any request body",
+        "discovery": "GET /_help for full endpoint catalog",
     }
 
 
@@ -821,8 +825,9 @@ def health():
 
 
 @app.get("/_help")
-def help_endpoint():
-    return root()
+async def help_endpoint(request: Request):
+    """Discover all available API endpoints and their parameters."""
+    return build_service_help(request.app)
 
 
 # ── Shared execution dispatcher ─────────────────
