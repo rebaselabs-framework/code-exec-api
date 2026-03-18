@@ -98,7 +98,7 @@ except ImportError:
 # Config
 # ──────────────────────────────────────────────
 
-VERSION = "2.0.0"
+VERSION = "2.2.0"
 MAX_TIMEOUT_SECONDS = 30
 DEFAULT_TIMEOUT_SECONDS = 10
 MAX_OUTPUT_BYTES = 50_000     # 50KB
@@ -151,6 +151,7 @@ app.add_middleware(HelpMiddleware)
 # ──────────────────────────────────────────────
 
 SAFE_MODULES = {
+    # stdlib — pure computation
     "math", "cmath", "decimal", "fractions", "statistics",
     "random", "itertools", "functools", "operator",
     "collections", "heapq", "bisect",
@@ -163,6 +164,11 @@ SAFE_MODULES = {
     "enum", "dataclasses",
     "typing",
     "abc",
+    # data science — agents need these for analysis tasks
+    "numpy",         # numerical arrays, math (import numpy as np works)
+    "pandas",        # dataframes, CSV analysis (import pandas as pd works)
+    "scipy",         # statistical / signal processing
+    "sklearn",       # scikit-learn ML (optional, if installed)
 }
 
 
@@ -794,6 +800,7 @@ def root():
             "execute_batch":    "POST /api/execute/batch    — up to 10 concurrent tasks",
             "session_create":   "POST /api/session/create   — create stateful Python session",
             "session_execute":  "POST /api/session/execute  — run code in session",
+            "session_list":     "GET  /api/session          — list all active sessions (new v2.2)",
             "session_info":     "GET  /api/session/{id}     — session status + variables",
             "session_delete":   "DELETE /api/session/{id}   — destroy session",
             "health":           "GET  /health",
@@ -1036,6 +1043,35 @@ async def api_session_delete(session_id: str):
         del _sessions[session_id]
         return {"status": "deleted", "session_id": session_id}
     raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+
+
+@app.get("/api/session", tags=["sessions"])
+async def api_session_list():
+    """
+    List all active sessions with summary stats.
+
+    Shows session IDs, language, execution count, and idle time.
+    Sessions auto-expire after 10 minutes of inactivity.
+    """
+    _expire_sessions()
+    now = time.monotonic()
+    sessions_summary = []
+    for sid, sess in _sessions.items():
+        idle = now - sess.last_used
+        remaining = max(0, SESSION_TTL_SECONDS - idle)
+        sessions_summary.append({
+            "session_id": sid,
+            "language": sess.language,
+            "execution_count": sess.execution_count,
+            "age_seconds": round(now - sess.created_at, 1),
+            "idle_seconds": round(idle, 1),
+            "ttl_remaining_seconds": int(remaining),
+        })
+    return {
+        "active_sessions": len(sessions_summary),
+        "max_sessions": MAX_SESSIONS,
+        "sessions": sorted(sessions_summary, key=lambda s: s["idle_seconds"]),
+    }
 
 
 # ── Auth admin ─────────────────────────────────

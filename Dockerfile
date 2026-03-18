@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -e .
 
 # App source
 COPY auth.py app.py ./
+COPY help ./help
 
 # Data dir for SQLite auth DB
 RUN mkdir -p /app/data
@@ -28,4 +29,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=15s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Single worker required: in-memory sessions are worker-local.
+# Concurrency is handled by the thread pool inside the process.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
